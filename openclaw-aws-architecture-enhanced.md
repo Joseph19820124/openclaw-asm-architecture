@@ -40,6 +40,11 @@
 
 ## 完整架构图
 
+![OpenClaw AWS 架构图](openclaw-architecture.png)
+
+<details>
+<summary>Mermaid 源码（点击展开）</summary>
+
 ```mermaid
 flowchart TB
     subgraph Internet["🌐 Internet"]
@@ -231,6 +236,8 @@ flowchart TB
     class CW,XRay,Prometheus,Grafana,Synthetics,RUM,CI observability
     class DR_Gateway,DR_Node,DR_DDB,DR_S3 dr
 ```
+
+</details>
 
 ---
 
