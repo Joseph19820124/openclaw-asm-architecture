@@ -1,3 +1,6 @@
+
+```mermaid
+
 graph TD
     %% 外部请求
     User((User/Client)) -- HTTPS --> WAF[AWS WAF]
