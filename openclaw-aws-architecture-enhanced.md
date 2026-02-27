@@ -31,7 +31,7 @@
 | 设计原则 | 实现方式 |
 |----------|----------|
 | **高可用** | 多 AZ 部署 + 跨区域灾备 + 自动故障转移 |
-| **可扩展** | 按队列独立扩缩容 + Fargate Serverless |
+| **可扩展** | 按队列深度统一扩缩容 + Fargate Serverless |
 | **安全** | 纵深防御 + 零信任 + 全链路加密 |
 | **可观测** | 指标 + 日志 + 追踪 + 拨测 四位一体 |
 | **解耦** | EventBridge 事件总线 + SQS 消息队列 |
@@ -70,26 +70,19 @@ flowchart TB
         EB["EventBridge EventBus<br/>Schema Registry / Archive / Replay"]
 
         subgraph Queues["Message Queues"]
-            SQS_Browser["SQS: Browser Queue"]
-            SQS_Tools["SQS: Tools Queue"]
-            SQS_LLM["SQS: LLM Queue (FIFO)"]
-            DLQ_Browser["DLQ: Browser"]
-            DLQ_Tools["DLQ: Tools"]
-            DLQ_LLM["DLQ: LLM"]
+            SQS_Task["SQS: Task Queue<br/>Standard Queue"]
+            DLQ_Task["DLQ: Task Dead Letter Queue"]
         end
 
         DLQ_Handler["DLQ Handler Lambda<br/>Alerting / Auto Retry"]
     end
 
     subgraph Workers["Worker Execution Layer"]
-        BW["Browser Worker<br/>ECS Fargate<br/>Playwright / Puppeteer"]
-        TW["Tools Worker<br/>ECS Fargate<br/>MCP Tools Execution"]
-        LW["LLM Worker<br/>ECS Fargate<br/>Model Orchestration"]
+        Node["OpenClaw Node<br/>ECS Fargate<br/>Browser + Tools + LLM<br/>Agent Loop"]
     end
 
     subgraph AI["AI/ML Layer"]
         Bedrock["Amazon Bedrock<br/>Claude / Titan / Mistral<br/>Prompt Caching"]
-        ModelGW["Model Gateway<br/>Multi-Model Routing / Fallback"]
         OpenSearch["OpenSearch Serverless<br/>Vector DB for RAG"]
         SageMaker["SageMaker Endpoint<br/>Custom Fine-tuned Models"]
     end
@@ -107,7 +100,7 @@ flowchart TB
         end
 
         subgraph Orchestration["Orchestration"]
-            SF["Step Functions<br/>Workflow Orchestrator"]
+            SF["Step Functions<br/>Task Lifecycle Management"]
             AppConfig["AppConfig<br/>Feature Flags / Canary Release"]
         end
     end
@@ -144,7 +137,7 @@ flowchart TB
 
     subgraph DR["DR Region (us-west-2)"]
         DR_Gateway["Gateway (Pilot Light)"]
-        DR_Workers["Workers (Scaled to 0)"]
+        DR_Node["OpenClaw Node (Scaled to 0)"]
         DR_DDB["DynamoDB Replica"]
         DR_S3["S3 Replica"]
     end
@@ -172,42 +165,27 @@ flowchart TB
     Gateway --> EB
 
     %% Connections - Event Routing
-    EB --> SQS_Browser
-    EB --> SQS_Tools
-    EB --> SQS_LLM
-    SQS_Browser -.-> DLQ_Browser
-    SQS_Tools -.-> DLQ_Tools
-    SQS_LLM -.-> DLQ_LLM
-    DLQ_Browser --> DLQ_Handler
-    DLQ_Tools --> DLQ_Handler
-    DLQ_LLM --> DLQ_Handler
+    EB --> SQS_Task
+    SQS_Task -.-> DLQ_Task
+    DLQ_Task --> DLQ_Handler
 
     %% Connections - Workers
-    SQS_Browser --> BW
-    SQS_Tools --> TW
-    SQS_LLM --> LW
+    SQS_Task --> Node
 
     %% Connections - AI
-    LW --> ModelGW
-    ModelGW --> Bedrock
-    ModelGW --> SageMaker
-    LW --> OpenSearch
-    BW --> OpenSearch
-    TW --> OpenSearch
+    Node --> Bedrock
+    Node --> SageMaker
+    Node --> OpenSearch
 
     %% Connections - Data
     Gateway --> DDB
-    BW --> DDB
-    TW --> DDB
-    LW --> DDB
+    Node --> DDB
     DDB --> DAX
     Gateway --> Redis
-    BW --> S3
-    TW --> S3
+    Node --> Redis
+    Node --> S3
     S3 --> S3_CRR
-    SF --> BW
-    SF --> TW
-    SF --> LW
+    SF --> Node
     Gateway --> AppConfig
 
     %% Connections - Security
@@ -223,24 +201,18 @@ flowchart TB
 
     %% Connections - Observability
     Gateway --> CW
-    BW --> CW
-    TW --> CW
-    LW --> CW
+    Node --> CW
     CW --> Prometheus
     Prometheus --> Grafana
     Gateway --> XRay
-    BW --> XRay
-    TW --> XRay
-    LW --> XRay
+    Node --> XRay
 
     %% Connections - CI/CD
     CodePipeline --> CodeBuild
     CodeBuild --> ECR
     ECR --> CodeDeploy
     CodeDeploy --> Gateway
-    CodeDeploy --> BW
-    CodeDeploy --> TW
-    CodeDeploy --> LW
+    CodeDeploy --> Node
 
     %% Styling
     classDef edge fill:#ff9900,stroke:#232f3e,color:#232f3e
@@ -253,11 +225,11 @@ flowchart TB
 
     class R53,Shield,WAF,CF,CFF,GA edge
     class SM,KMS,GD,SH,Inspector,Macie,Config,CT,AA,NF,Cognito,Guardrails security
-    class Gateway,BW,TW,LW,ALB compute
+    class Gateway,Node,ALB compute
     class DDB,DAX,S3,S3_CRR,Redis storage
-    class Bedrock,ModelGW,OpenSearch,SageMaker ai
+    class Bedrock,OpenSearch,SageMaker ai
     class CW,XRay,Prometheus,Grafana,Synthetics,RUM,CI observability
-    class DR_Gateway,DR_Workers,DR_DDB,DR_S3 dr
+    class DR_Gateway,DR_Node,DR_DDB,DR_S3 dr
 ```
 
 ---
@@ -366,59 +338,71 @@ TopicFilters:
 | 组件 | 服务 | 职责 |
 |------|------|------|
 | 事件总线 | EventBridge | 事件路由、Schema 管理、存档重放 |
-| 消息队列 | SQS Standard | Browser/Tools 任务队列 |
-| 消息队列 | SQS FIFO | LLM 任务队列 (保序) |
+| 任务队列 | SQS Standard | 统一任务队列 |
 | 死信队列 | SQS DLQ | 失败消息存储 |
 | 失败处理 | Lambda | DLQ 告警、自动重试 |
+
+> **设计说明**：采用单一标准队列而非按类型拆分，因为 OpenClaw Node 是统一执行单元，内部完成 Agent Loop（含 Browser、Tools、LLM 调用）。后续可按优先级或任务类型拆分为多个队列。
 
 **EventBridge 规则示例：**
 
 ```json
 {
   "source": ["openclaw.gateway"],
-  "detail-type": ["TaskCreated"],
-  "detail": {
-    "taskType": ["browser"]
-  }
+  "detail-type": ["TaskCreated"]
 }
-→ Target: SQS Browser Queue
+→ Target: SQS Task Queue
 ```
 
 **SQS 配置：**
 
 ```yaml
-BrowserQueue:
-  VisibilityTimeout: 900s    # 15分钟 (浏览器任务耗时长)
+TaskQueue:
+  VisibilityTimeout: 900s    # 15分钟 (Agent Loop 可能包含多步操作)
   MessageRetention: 7 days
   MaxReceiveCount: 3         # 失败3次进 DLQ
+  RedrivePolicy:
+    deadLetterTargetArn: !GetAtt TaskDLQ.Arn
 
-LLMQueue:
-  FifoQueue: true
-  ContentBasedDeduplication: true
-  VisibilityTimeout: 120s
+TaskDLQ:
+  MessageRetention: 14 days
 ```
 
 ---
 
 ### 5. Worker Execution Layer - 工作执行层
 
-独立扩缩容的任务执行单元。
+统一的 OpenClaw Node 执行单元，内部完成完整的 Agent Loop。
 
-| Worker | 职责 | 资源配置 | 扩缩容策略 |
-|--------|------|----------|------------|
-| Browser Worker | 网页自动化 (Playwright) | 2 vCPU / 4GB | 基于 SQS 队列深度 |
-| Tools Worker | MCP 工具执行 | 1 vCPU / 2GB | 基于 SQS 队列深度 |
-| LLM Worker | 模型调用编排 | 1 vCPU / 2GB | 基于 SQS 队列深度 |
+| 组件 | 说明 |
+|------|------|
+| **OpenClaw Node** | 统一执行单元（ECS Fargate Serverless） |
+| Browser 能力 | 应用代码内置（Puppeteer / Playwright），无需独立服务 |
+| Tools 能力 | 应用代码内置（MCP Tools），无需独立服务 |
+| LLM 调用 | 通过 API Key 调用 Bedrock，无需独立编排层 |
+| Agent Loop | Node 内部完成：接收任务 → 规划 → 执行（Browser/Tools/LLM）→ 返回结果 |
+
+> **为什么不拆分 Worker？** OpenClaw 的 Agent 执行逻辑是连续有状态流程——Browser、Tools 是 Node 应用层的内置能力，LLM 通过 API Key 直接调用 Bedrock。拆成三类 Worker 会导致上下文断裂、延迟叠加、编排复杂度爆炸。
 
 **Fargate Service 配置：**
 
 ```yaml
-BrowserWorkerService:
+OpenClawNodeService:
+  LaunchType: FARGATE
   DesiredCount: 2
   MinCapacity: 1
   MaxCapacity: 50
+
+  # 资源规格：从最小规格起步，根据实际负载调整
+  TaskDefinition:
+    Cpu: 1024              # 1 vCPU（起步）
+    Memory: 2048           # 2 GB（起步）
+    # 如需运行 Playwright/Puppeteer 等重浏览器任务，
+    # 可提升至 2 vCPU / 4 GB
+
   ScalingPolicy:
-    TargetValue: 5           # 每个任务5个消息
+    MetricName: ApproximateNumberOfMessagesVisible
+    TargetValue: 5         # 每个 Node 处理5条消息
     ScaleInCooldown: 60s
     ScaleOutCooldown: 30s
 
@@ -433,35 +417,43 @@ BrowserWorkerService:
 
 ### 6. AI/ML Layer - AI/ML 层
 
-多模型支持和 RAG 检索增强。
+OpenClaw Node 通过 API Key 直接调用 Bedrock，无需独立的 Model Gateway。
 
 | 组件 | 服务 | 职责 |
 |------|------|------|
-| 模型网关 | 自建 | 多模型路由、故障切换、成本优化 |
 | 基础模型 | Bedrock | Claude / Titan / Mistral |
 | 自定义模型 | SageMaker | 微调模型部署 |
 | 向量检索 | OpenSearch Serverless | RAG 知识库 |
 
-**Model Gateway 路由策略：**
+> **为什么去掉独立 Model Gateway？** OpenClaw Node 内的 Agent Loop 直接通过 API Key 调用 Bedrock。Bedrock 本身已提供多模型支持、限流和 Prompt Caching。如需模型路由/降级策略，可在 Node 应用代码中实现，无需额外基础设施。
+
+**LLM 调用路径：**
+
+```
+OpenClaw Node → (API Key / IAM Role) → Amazon Bedrock
+                                         ├── Claude (主模型)
+                                         ├── Titan (Embedding)
+                                         └── Mistral (备选)
+```
+
+**Bedrock 调用配置（Node 应用层）：**
 
 ```yaml
-Routes:
-  - name: primary
-    model: anthropic.claude-3-5-sonnet
-    weight: 80
+BedrockConfig:
+  PrimaryModel: anthropic.claude-3-5-sonnet
+  FallbackModel: anthropic.claude-3-haiku
+  FallbackConditions:
+    - type: latency
+      threshold: 5000ms
+    - type: error_rate
+      threshold: 5%
 
-  - name: fallback
-    model: anthropic.claude-3-haiku
-    weight: 20
-    conditions:
-      - type: latency
-        threshold: 5000ms
-      - type: error_rate
-        threshold: 5%
+  PromptCaching:
+    enabled: true
+    ttl: 3600s
 
-PromptCaching:
-  enabled: true
-  ttl: 3600s
+  # 通过 VPC Endpoint (PrivateLink) 访问 Bedrock
+  Endpoint: vpce-xxxx.bedrock-runtime.us-east-1.vpce.amazonaws.com
 ```
 
 **OpenSearch 向量索引：**
@@ -499,8 +491,10 @@ PromptCaching:
 | 读加速 | DAX | 微秒级读取缓存 |
 | 对象存储 | S3 | 截图、产物、日志 |
 | 应用缓存 | ElastiCache Redis | Session、API 缓存、分布式锁 |
-| 工作流 | Step Functions | 复杂任务编排 |
+| 工作流 | Step Functions | 任务生命周期管理（创建→分发→超时→完成） |
 | 配置 | AppConfig | Feature Flags、灰度发布 |
+
+> **编排简化说明**：Agent Loop（规划→Browser→Tools→LLM→迭代）在 OpenClaw Node 内部完成，Step Functions 不再编排 Agent 执行步骤，仅负责任务生命周期管理（超时处理、重试、状态转换等）。
 
 **DynamoDB 表设计：**
 
@@ -647,14 +641,14 @@ Alarms:
 │   12.5K/min   │    0.12%      │    1.2s       │    156      │
 ├───────────────┴───────────────┴───────────────┴─────────────┤
 │                    Request Flow                              │
-│  [Gateway] ──→ [EventBridge] ──→ [Workers] ──→ [Bedrock]   │
+│  [Gateway] ──→ [EventBridge] ──→ [SQS] ──→ [Node] ──→ [BR] │
 ├─────────────────────────────────────────────────────────────┤
-│ Worker Status          │ Queue Depth                        │
-│ Browser: 5/50 (10%)    │ Browser: 23 ████░░░░               │
-│ Tools:   3/20 (15%)    │ Tools:   12 ██░░░░░░               │
-│ LLM:     8/30 (27%)    │ LLM:     45 ██████░░               │
+│ Node Status            │ Queue Depth                        │
+│ Nodes: 8/50 (16%)      │ Task Queue: 45 ██████░░            │
+│ CPU Avg: 42%           │ DLQ:         0 ░░░░░░░░            │
+│ Memory Avg: 61%        │                                    │
 ├─────────────────────────────────────────────────────────────┤
-│ LLM Metrics                                                  │
+│ LLM Metrics (Bedrock)                                        │
 │ Token Usage: 1.2M/day  │ Avg Latency: 800ms │ Cache Hit: 34%│
 └─────────────────────────────────────────────────────────────┘
 ```
@@ -791,18 +785,19 @@ DeploymentConfig:
     ▼
 ┌──────────────────────────────────────────────────────────────┐
 │ 4. Event Routing                                              │
-│    EventBridge 根据 taskType 路由:                            │
-│         ├─→ browser → SQS Browser Queue                       │
-│         ├─→ tools   → SQS Tools Queue                         │
-│         └─→ llm     → SQS LLM Queue (FIFO)                    │
+│    EventBridge → SQS Task Queue                               │
+│    (失败消息 → DLQ → Lambda 告警/重试)                        │
 └──────────────────────────────────────────────────────────────┘
     │
     ▼
 ┌──────────────────────────────────────────────────────────────┐
-│ 5. Worker Execution                                           │
-│    Worker 拉取消息:                                           │
+│ 5. OpenClaw Node (Agent Loop)                                 │
+│    Node 拉取消息，内部完成完整 Agent 循环:                    │
 │         ├─→ 更新任务状态 (DynamoDB)                           │
-│         ├─→ 执行任务 (Browser/Tools/LLM)                      │
+│         ├─→ 规划 → 调用 LLM (Bedrock API)                    │
+│         ├─→ 执行 Browser 操作 (内置 Puppeteer/Playwright)     │
+│         ├─→ 执行 Tools 操作 (内置 MCP Tools)                  │
+│         ├─→ 迭代（LLM → Browser → Tools → LLM → ...）       │
 │         ├─→ 存储产物 (S3)                                     │
 │         └─→ 发布 TaskCompleted 事件                           │
 └──────────────────────────────────────────────────────────────┘
@@ -872,14 +867,14 @@ DeploymentConfig:
 
 | 类别 | 服务 | 月估算 (USD) |
 |------|------|-------------|
-| **计算** | Fargate (Gateway + Workers) | $800 - $2,000 |
+| **计算** | Fargate (Gateway + OpenClaw Node) | $500 - $1,500 |
 | **网络** | CloudFront + Global Accelerator + NAT | $200 - $500 |
 | **存储** | DynamoDB + S3 + ElastiCache | $300 - $800 |
 | **AI/ML** | Bedrock + OpenSearch | $1,000 - $5,000 |
 | **安全** | Shield Adv + WAF + GuardDuty | $3,000 + $100 + $50 |
 | **监控** | CloudWatch + X-Ray + Grafana | $200 - $500 |
 | **其他** | Secrets Manager + KMS + Route 53 | $50 - $100 |
-| **总计** | | **$5,700 - $12,000+** |
+| **总计** | | **$5,400 - $11,500+** |
 
 ---
 
