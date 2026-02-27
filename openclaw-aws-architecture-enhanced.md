@@ -878,13 +878,673 @@ DeploymentConfig:
 
 ---
 
+## 高级玩法
+
+### 1. App Mesh - 服务网格
+
+在微服务间实现零信任网络、流量控制和可观测性。
+
+**架构位置：**
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        App Mesh                                  │
+│  ┌─────────────┐    ┌─────────────┐    ┌─────────────┐         │
+│  │   Gateway   │    │   Browser   │    │    LLM      │         │
+│  │   Service   │◀──▶│   Worker    │◀──▶│   Worker    │         │
+│  │ + Envoy     │    │ + Envoy     │    │ + Envoy     │         │
+│  └─────────────┘    └─────────────┘    └─────────────┘         │
+│         │                  │                  │                  │
+│         └──────────────────┼──────────────────┘                  │
+│                            ▼                                     │
+│                    ┌─────────────┐                               │
+│                    │ Virtual     │                               │
+│                    │ Gateway     │                               │
+│                    └─────────────┘                               │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**核心能力：**
+
+| 能力 | 实现 | 价值 |
+|------|------|------|
+| mTLS | 服务间自动加密 | 零信任网络 |
+| 流量分割 | 按权重路由 | 金丝雀发布 |
+| 重试策略 | 自动重试 + 熔断 | 提高可靠性 |
+| 可观测性 | Envoy 指标 + 追踪 | 深度洞察 |
+
+**配置示例：**
+
+```yaml
+# Virtual Service - 流量分割
+apiVersion: appmesh.k8s.aws/v1beta2
+kind: VirtualService
+metadata:
+  name: llm-worker
+spec:
+  provider:
+    virtualRouter:
+      virtualRouterRef:
+        name: llm-worker-router
+
+---
+# Virtual Router - 金丝雀路由
+apiVersion: appmesh.k8s.aws/v1beta2
+kind: VirtualRouter
+metadata:
+  name: llm-worker-router
+spec:
+  routes:
+    - name: canary-route
+      httpRoute:
+        match:
+          prefix: /
+        action:
+          weightedTargets:
+            - virtualNodeRef:
+                name: llm-worker-v1
+              weight: 90
+            - virtualNodeRef:
+                name: llm-worker-v2
+              weight: 10
+        retryPolicy:
+          maxRetries: 3
+          perRetryTimeout:
+            value: 5
+            unit: s
+          httpRetryEvents:
+            - server-error
+            - gateway-error
+```
+
+**熔断配置：**
+
+```yaml
+# Virtual Node - 熔断器
+apiVersion: appmesh.k8s.aws/v1beta2
+kind: VirtualNode
+metadata:
+  name: llm-worker-v1
+spec:
+  listeners:
+    - portMapping:
+        port: 8080
+        protocol: http
+      outlierDetection:
+        maxServerErrors: 5
+        maxEjectionPercent: 100
+        interval:
+          value: 10
+          unit: s
+        baseEjectionDuration:
+          value: 30
+          unit: s
+```
+
+---
+
+### 2. Fault Injection Simulator (FIS) - 混沌工程
+
+主动注入故障，验证系统韧性。
+
+**实验场景：**
+
+| 场景 | 故障类型 | 验证目标 |
+|------|----------|----------|
+| Worker 宕机 | 终止 ECS Task | 自动扩容恢复 |
+| 网络延迟 | 注入 100ms 延迟 | 超时处理 |
+| DynamoDB 限流 | 模拟 ThrottlingException | 重试逻辑 |
+| Bedrock 不可用 | 阻断网络 | 模型 Fallback |
+| AZ 故障 | 终止整个 AZ 实例 | 跨 AZ 容灾 |
+
+**FIS 实验模板：**
+
+```yaml
+# 实验1: Worker 宕机恢复
+ExperimentTemplate:
+  Name: worker-failure-recovery
+  Description: 验证 Worker 宕机后自动恢复
+
+  Targets:
+    EcsTasks:
+      ResourceType: aws:ecs:task
+      SelectionMode: COUNT(2)
+      ResourceTags:
+        Service: browser-worker
+
+  Actions:
+    StopTasks:
+      ActionId: aws:ecs:stop-task
+      Parameters: {}
+      Targets:
+        Tasks: EcsTasks
+
+  StopConditions:
+    - Source: aws:cloudwatch:alarm
+      Value: arn:aws:cloudwatch:*:*:alarm:HighErrorRate
+
+---
+# 实验2: 网络延迟注入
+ExperimentTemplate:
+  Name: network-latency-injection
+  Description: 验证服务在网络延迟下的表现
+
+  Targets:
+    EcsTasks:
+      ResourceType: aws:ecs:task
+      SelectionMode: ALL
+      ResourceTags:
+        Service: llm-worker
+
+  Actions:
+    InjectLatency:
+      ActionId: aws:ssm:send-command
+      Parameters:
+        documentArn: arn:aws:ssm:*:*:document/AWSFIS-Run-Network-Latency
+        documentParameters: '{"latencyMs":"100","interface":"eth0","durationSeconds":"300"}'
+      Duration: PT5M
+      Targets:
+        Instances: EcsTasks
+
+---
+# 实验3: AZ 故障模拟
+ExperimentTemplate:
+  Name: az-failure-simulation
+  Description: 验证单 AZ 故障时的跨 AZ 容灾
+
+  Targets:
+    Subnets:
+      ResourceType: aws:ec2:subnet
+      SelectionMode: ALL
+      Filters:
+        - Path: AvailabilityZone
+          Values: [us-east-1a]
+
+  Actions:
+    DisruptConnectivity:
+      ActionId: aws:network:disrupt-connectivity
+      Parameters:
+        scope: all
+        duration: PT10M
+      Targets:
+        Subnets: Subnets
+```
+
+**混沌工程实践流程：**
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    Chaos Engineering Loop                        │
+│                                                                  │
+│   ┌──────────┐    ┌──────────┐    ┌──────────┐    ┌──────────┐ │
+│   │  假设    │───▶│  实验    │───▶│  观察    │───▶│  学习    │ │
+│   │ Hypothesis│    │ Experiment│   │ Observe  │    │  Learn   │ │
+│   └──────────┘    └──────────┘    └──────────┘    └──────────┘ │
+│        │                                               │        │
+│        └───────────────────────────────────────────────┘        │
+│                                                                  │
+│   Example:                                                       │
+│   假设: Worker 故障时，系统在 60s 内恢复                         │
+│   实验: 终止 2 个 Browser Worker Task                            │
+│   观察: 监控错误率、队列深度、新 Task 启动时间                   │
+│   学习: 发现冷启动需要 45s，调整 MinCapacity 为 2               │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**GameDay 计划：**
+
+```yaml
+GameDay:
+  Name: OpenClaw Resilience GameDay Q1 2026
+  Duration: 4 hours
+
+  Scenarios:
+    - Name: "单 Worker 故障"
+      Duration: 30min
+      Experiments: [worker-failure-recovery]
+      Success Criteria: 错误率 < 1%, 恢复时间 < 60s
+
+    - Name: "LLM 服务降级"
+      Duration: 45min
+      Experiments: [bedrock-unavailable]
+      Success Criteria: Fallback 到备用模型, 延迟 < 2x
+
+    - Name: "数据库限流"
+      Duration: 30min
+      Experiments: [dynamodb-throttling]
+      Success Criteria: 重试成功, 无数据丢失
+
+    - Name: "单 AZ 故障"
+      Duration: 60min
+      Experiments: [az-failure-simulation]
+      Success Criteria: 服务可用, 自动切换到其他 AZ
+```
+
+---
+
+### 3. Kinesis Data Streams - 实时数据流
+
+用于实时分析、事件溯源和流式处理。
+
+**架构位置：**
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    Real-time Analytics Pipeline                  │
+│                                                                  │
+│  Gateway ───▶ Kinesis Data Streams ───▶ Kinesis Data Analytics │
+│     │                  │                         │               │
+│     │                  ▼                         ▼               │
+│     │         Kinesis Firehose          Real-time Dashboard     │
+│     │                  │                    (Grafana)            │
+│     │                  ▼                                         │
+│     │              S3 (Raw)                                      │
+│     │                  │                                         │
+│     │                  ▼                                         │
+│     │             Athena / Glue                                  │
+│     │                  │                                         │
+│     │                  ▼                                         │
+│     └────────▶ QuickSight (BI)                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**使用场景：**
+
+| 场景 | 数据源 | 处理逻辑 | 输出 |
+|------|--------|----------|------|
+| 实时用量统计 | API 请求事件 | 按用户/API 聚合 | Grafana Dashboard |
+| 异常检测 | Worker 日志 | 异常模式识别 | SNS 告警 |
+| Token 使用追踪 | LLM 调用事件 | 累计统计 | 计费系统 |
+| 用户行为分析 | 全链路事件 | 漏斗分析 | QuickSight |
+
+**Kinesis 配置：**
+
+```yaml
+# Kinesis Data Stream
+OpenClawEventStream:
+  ShardCount: 4
+  RetentionPeriod: 168  # 7 天
+  StreamModeDetails:
+    StreamMode: ON_DEMAND  # 自动扩容
+
+  EnhancedMonitoring:
+    - ShardLevelMetrics:
+        - IncomingBytes
+        - OutgoingBytes
+        - WriteProvisionedThroughputExceeded
+
+# Kinesis Data Analytics - 实时聚合
+CREATE OR REPLACE STREAM "DESTINATION_STREAM" (
+    user_id VARCHAR(64),
+    window_start TIMESTAMP,
+    request_count BIGINT,
+    total_tokens BIGINT,
+    avg_latency_ms DOUBLE
+);
+
+CREATE OR REPLACE PUMP "AGGREGATION_PUMP" AS
+INSERT INTO "DESTINATION_STREAM"
+SELECT STREAM
+    user_id,
+    STEP("SOURCE_STREAM".ROWTIME BY INTERVAL '1' MINUTE) AS window_start,
+    COUNT(*) AS request_count,
+    SUM(tokens_used) AS total_tokens,
+    AVG(latency_ms) AS avg_latency_ms
+FROM "SOURCE_STREAM"
+GROUP BY
+    user_id,
+    STEP("SOURCE_STREAM".ROWTIME BY INTERVAL '1' MINUTE);
+```
+
+**事件 Schema：**
+
+```json
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "properties": {
+    "event_id": { "type": "string", "format": "uuid" },
+    "event_type": {
+      "type": "string",
+      "enum": ["task.created", "task.started", "task.completed", "llm.invoked"]
+    },
+    "timestamp": { "type": "string", "format": "date-time" },
+    "user_id": { "type": "string" },
+    "task_id": { "type": "string" },
+    "metadata": {
+      "type": "object",
+      "properties": {
+        "model": { "type": "string" },
+        "tokens_input": { "type": "integer" },
+        "tokens_output": { "type": "integer" },
+        "latency_ms": { "type": "integer" }
+      }
+    }
+  },
+  "required": ["event_id", "event_type", "timestamp"]
+}
+```
+
+---
+
+### 4. Lake Formation - 数据湖
+
+统一数据治理、权限管理和分析。
+
+**数据湖架构：**
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                      Data Lake Architecture                      │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────────┐│
+│  │                    Lake Formation                            ││
+│  │  ┌──────────────┐ ┌──────────────┐ ┌──────────────┐        ││
+│  │  │ Data Catalog │ │ Permissions  │ │  Governance  │        ││
+│  │  └──────────────┘ └──────────────┘ └──────────────┘        ││
+│  └─────────────────────────────────────────────────────────────┘│
+│                              │                                   │
+│  ┌───────────────────────────┼───────────────────────────────┐  │
+│  │                     S3 Data Lake                           │  │
+│  │  ┌──────────┐    ┌──────────┐    ┌──────────┐            │  │
+│  │  │  Bronze  │───▶│  Silver  │───▶│   Gold   │            │  │
+│  │  │  (Raw)   │    │(Cleaned) │    │(Curated) │            │  │
+│  │  └──────────┘    └──────────┘    └──────────┘            │  │
+│  └───────────────────────────────────────────────────────────┘  │
+│                              │                                   │
+│  ┌───────────────────────────┼───────────────────────────────┐  │
+│  │                   Analytics Layer                          │  │
+│  │  ┌──────────┐    ┌──────────┐    ┌──────────┐            │  │
+│  │  │  Athena  │    │ Redshift │    │QuickSight│            │  │
+│  │  │(Ad-hoc)  │    │(Warehouse)    │  (BI)    │            │  │
+│  │  └──────────┘    └──────────┘    └──────────┘            │  │
+│  └───────────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**数据分层：**
+
+| 层级 | 内容 | 格式 | 保留期 |
+|------|------|------|--------|
+| Bronze | 原始事件、日志 | JSON | 90 天 |
+| Silver | 清洗后数据 | Parquet | 1 年 |
+| Gold | 聚合指标、报表 | Parquet | 永久 |
+
+**Glue ETL Job：**
+
+```python
+# Bronze to Silver ETL
+import sys
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+
+glueContext = GlueContext(SparkContext.getOrCreate())
+spark = glueContext.spark_session
+
+# Read Bronze data
+bronze_df = glueContext.create_dynamic_frame.from_catalog(
+    database="openclaw_bronze",
+    table_name="events"
+)
+
+# Transform
+silver_df = bronze_df.toDF() \
+    .dropDuplicates(["event_id"]) \
+    .withColumn("date", F.to_date("timestamp")) \
+    .withColumn("hour", F.hour("timestamp"))
+
+# Write Silver data (partitioned)
+silver_df.write \
+    .mode("append") \
+    .partitionBy("date", "hour") \
+    .parquet("s3://openclaw-datalake/silver/events/")
+```
+
+**Lake Formation 权限：**
+
+```yaml
+# 细粒度权限控制
+Permissions:
+  - Principal: arn:aws:iam::*:role/DataAnalystRole
+    Resource:
+      Database: openclaw_gold
+    Permissions:
+      - SELECT
+
+  - Principal: arn:aws:iam::*:role/DataEngineerRole
+    Resource:
+      Database: openclaw_silver
+    Permissions:
+      - SELECT
+      - INSERT
+      - DELETE
+
+  - Principal: arn:aws:iam::*:role/AdminRole
+    Resource:
+      Database: openclaw_*
+    Permissions:
+      - ALL
+```
+
+---
+
+### 5. AppSync - GraphQL API
+
+为前端提供灵活的 GraphQL 接口。
+
+**适用场景：**
+
+| 场景 | REST 痛点 | GraphQL 优势 |
+|------|-----------|--------------|
+| Dashboard | 多次请求拼接数据 | 单次查询获取所需字段 |
+| 移动端 | 返回过多不需要的数据 | 按需获取，节省带宽 |
+| 实时更新 | 轮询浪费资源 | Subscription 实时推送 |
+
+**Schema 设计：**
+
+```graphql
+type Task {
+  id: ID!
+  status: TaskStatus!
+  type: TaskType!
+  createdAt: AWSDateTime!
+  completedAt: AWSDateTime
+  user: User!
+  steps: [TaskStep!]!
+  artifacts: [Artifact!]
+  metrics: TaskMetrics
+}
+
+type TaskStep {
+  id: ID!
+  name: String!
+  status: StepStatus!
+  startedAt: AWSDateTime
+  completedAt: AWSDateTime
+  output: AWSJSON
+}
+
+type TaskMetrics {
+  totalTokens: Int!
+  inputTokens: Int!
+  outputTokens: Int!
+  latencyMs: Int!
+  cost: Float!
+}
+
+type Query {
+  getTask(id: ID!): Task
+  listTasks(
+    filter: TaskFilterInput
+    limit: Int
+    nextToken: String
+  ): TaskConnection!
+
+  # Dashboard 聚合查询
+  getDashboardMetrics(
+    timeRange: TimeRangeInput!
+  ): DashboardMetrics!
+}
+
+type Mutation {
+  createTask(input: CreateTaskInput!): Task!
+  cancelTask(id: ID!): Task!
+}
+
+type Subscription {
+  onTaskStatusChanged(taskId: ID!): Task
+    @aws_subscribe(mutations: ["updateTaskStatus"])
+
+  onNewTask(userId: ID!): Task
+    @aws_subscribe(mutations: ["createTask"])
+}
+
+# Dashboard 一次查询获取所有需要的数据
+query GetDashboard {
+  getDashboardMetrics(timeRange: { start: "2026-02-27", end: "2026-02-27" }) {
+    totalTasks
+    completedTasks
+    failedTasks
+    avgLatencyMs
+    totalTokens
+    costUsd
+    tasksByType {
+      browser
+      tools
+      llm
+    }
+    hourlyDistribution {
+      hour
+      count
+    }
+  }
+
+  listTasks(filter: { status: RUNNING }, limit: 10) {
+    items {
+      id
+      type
+      status
+      createdAt
+      steps {
+        name
+        status
+      }
+    }
+  }
+}
+```
+
+**Resolver 配置：**
+
+```yaml
+# DynamoDB Resolver
+GetTaskResolver:
+  Type: AWS::AppSync::Resolver
+  Properties:
+    ApiId: !GetAtt GraphQLApi.ApiId
+    TypeName: Query
+    FieldName: getTask
+    DataSourceName: !GetAtt TasksDataSource.Name
+    RequestMappingTemplate: |
+      {
+        "version": "2018-05-29",
+        "operation": "GetItem",
+        "key": {
+          "PK": $util.dynamodb.toDynamoDBJson("TASK#${ctx.args.id}"),
+          "SK": $util.dynamodb.toDynamoDBJson("METADATA")
+        }
+      }
+    ResponseMappingTemplate: |
+      $util.toJson($ctx.result)
+
+# Pipeline Resolver - 复杂查询
+DashboardMetricsResolver:
+  Type: AWS::AppSync::Resolver
+  Properties:
+    Kind: PIPELINE
+    PipelineConfig:
+      Functions:
+        - !GetAtt GetTaskCountsFunction.FunctionId
+        - !GetAtt GetTokenUsageFunction.FunctionId
+        - !GetAtt GetCostFunction.FunctionId
+```
+
+---
+
+### 6. 高级玩法整合架构图
+
+```mermaid
+flowchart TB
+    subgraph Advanced["高级玩法层"]
+        subgraph Mesh["Service Mesh"]
+            AppMesh["App Mesh"]
+            Envoy["Envoy Sidecars"]
+        end
+
+        subgraph Chaos["Chaos Engineering"]
+            FIS["Fault Injection Simulator"]
+            GameDay["GameDay Automation"]
+        end
+
+        subgraph Streaming["Real-time Streaming"]
+            Kinesis["Kinesis Data Streams"]
+            KDA["Kinesis Data Analytics"]
+            Firehose["Kinesis Firehose"]
+        end
+
+        subgraph DataLake["Data Lake"]
+            LF["Lake Formation"]
+            Glue["Glue ETL"]
+            Athena["Athena"]
+        end
+
+        subgraph GraphQL["GraphQL Layer"]
+            AppSync["AppSync"]
+            Subscriptions["Real-time Subscriptions"]
+        end
+    end
+
+    subgraph Core["核心架构"]
+        Gateway["OpenClaw Gateway"]
+        Workers["Workers"]
+        DDB["DynamoDB"]
+        S3["S3"]
+    end
+
+    %% Connections
+    Gateway <--> AppMesh
+    Workers <--> AppMesh
+    AppMesh --> Envoy
+
+    FIS --> Gateway
+    FIS --> Workers
+
+    Gateway --> Kinesis
+    Workers --> Kinesis
+    Kinesis --> KDA
+    Kinesis --> Firehose
+    Firehose --> S3
+
+    S3 --> LF
+    LF --> Glue
+    Glue --> Athena
+
+    AppSync --> Gateway
+    AppSync --> DDB
+    AppSync --> Subscriptions
+```
+
+---
+
 ## 下一步
 
-- [ ] 高级玩法：App Mesh 服务网格
-- [ ] 高级玩法：Fault Injection Simulator 混沌工程
-- [ ] 高级玩法：Kinesis 实时数据流
-- [ ] 高级玩法：Lake Formation 数据湖
 - [ ] IaC 实现 (CDK / Terraform)
+- [ ] 性能测试方案
+- [ ] 成本优化策略
+- [ ] 多租户隔离设计
 
 ---
 
