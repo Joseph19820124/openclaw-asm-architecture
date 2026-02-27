@@ -1,4 +1,3 @@
-# OpenClaw AWS 架构设计
 
 ```mermaid
 graph TD
